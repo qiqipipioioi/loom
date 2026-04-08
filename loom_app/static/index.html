@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Loom</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@500;600;700&family=Manrope:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/static/styles.css?v=13" />
+    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg?v=2" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand-block">
+          <svg width="28" height="28" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <rect width="32" height="32" rx="8" fill="#1f1b18"/>
+            <path d="M13 8C13 6.89543 12.1046 6 11 6C9.89543 6 9 6.89543 9 8V22C9 24.2091 10.7909 26 13 26H21C22.1046 26 23 25.1046 23 24C23 22.8954 22.1046 22 21 22H13V8Z" fill="#faf8f5"/>
+          </svg>
+          <div>
+            <h1>Loom</h1>
+          </div>
+        </div>
+        <div class="topbar-meta">
+          <span class="connection-dot" id="socket-indicator" data-state="disconnected"></span>
+          <button class="settings-button" id="settings-button" type="button">设置</button>
+        </div>
+      </header>
+
+      <main class="main-stage">
+        <div class="panel-header">
+          <div class="toolbar">
+            <select id="timeline-category-filter">
+              <option value="">全部分类</option>
+              <option value="时政">时政</option>
+              <option value="AI">AI</option>
+              <option value="科技">科技</option>
+              <option value="宏观">宏观</option>
+              <option value="数字货币">数字货币</option>
+            </select>
+            <select id="timeline-sort-filter">
+              <option value="latest">按最新</option>
+              <option value="importance">按重要性</option>
+              <option value="heat">按热度</option>
+            </select>
+            <label class="toggle-chip">
+              <input id="timeline-importance-filter" type="checkbox" />
+              <span>高重要</span>
+            </label>
+          </div>
+        </div>
+
+        <div class="timeline-grid">
+          <section class="timeline-column">
+            <div class="timeline-overview" id="timeline-overview"></div>
+            <div class="timeline-list" id="timeline-list"></div>
+            <div class="timeline-load-more" id="timeline-load-more">
+              <span class="muted-text" id="timeline-load-more-text"></span>
+            </div>
+          </section>
+          <aside class="detail-panel" id="detail-panel">
+            <div class="detail-placeholder">
+              <p class="eyebrow">Detail</p>
+              <h3>选择一条消息</h3>
+              <p>右侧会展开该聚合下的全部来源、摘要与原文链接。</p>
+            </div>
+          </aside>
+        </div>
+      </main>
+    </div>
+
+    <aside class="settings-panel" id="settings-panel" hidden>
+      <div class="settings-header">
+        <div>
+          <p class="eyebrow">Workspace</p>
+          <h3>设置</h3>
+        </div>
+        <button class="ghost-button compact-button" id="close-settings-button" type="button">关闭</button>
+      </div>
+      <div class="settings-actions">
+        <button class="ghost-button compact-button" id="manual-sync-button" type="button">手动同步</button>
+        <button class="ghost-button compact-button" id="bulk-x-import-button" type="button">批量导入 X</button>
+        <button class="ghost-button compact-button" id="new-source-button" type="button">新增来源</button>
+      </div>
+      <p class="form-feedback" id="sync-feedback"></p>
+      <section class="settings-section settings-section-sources">
+        <div class="section-header">
+          <p class="eyebrow">Sources</p>
+          <span class="muted-text">来源配置</span>
+        </div>
+        <div class="source-table" id="source-table"></div>
+      </section>
+      <section class="settings-section">
+        <div class="section-header">
+          <p class="eyebrow">System</p>
+          <span class="muted-text">系统状态</span>
+        </div>
+        <div class="status-grid" id="status-grid"></div>
+      </section>
+      <section class="settings-section">
+        <div class="section-header">
+          <p class="eyebrow">LM Studio</p>
+          <span class="muted-text">本地 AI 配置</span>
+        </div>
+        <form class="form-grid" id="ai-config-form">
+          <label class="full-width">
+            <span>Base URL</span>
+            <input id="ai-base-url" placeholder="http://127.0.0.1:1234" required type="url" />
+          </label>
+          <label>
+            <span>模型 ID</span>
+            <input id="ai-model" placeholder="qwen2.5-7b-instruct" required />
+          </label>
+          <label>
+            <span>API Key</span>
+            <input id="ai-api-key" placeholder="留空表示不修改当前值" type="password" />
+          </label>
+          <label class="full-width">
+            <span>分类列表</span>
+            <textarea
+              id="ai-categories"
+              rows="4"
+              placeholder="时政&#10;科技&#10;AI&#10;宏观&#10;数字货币&#10;其他"
+              required
+            ></textarea>
+          </label>
+          <label class="toggle-chip">
+            <input id="ai-translation-enabled" checked type="checkbox" />
+            <span>启用翻译</span>
+          </label>
+          <label class="toggle-chip">
+            <input id="ai-classification-enabled" checked type="checkbox" />
+            <span>启用分类</span>
+          </label>
+          <label class="toggle-chip">
+            <input id="ai-clear-api-key" type="checkbox" />
+            <span>清空 API Key</span>
+          </label>
+          <div class="form-actions full-width">
+            <button class="ghost-button" id="test-ai-button" type="button">测试 LM Studio</button>
+            <button class="primary-button" type="submit">保存 AI 配置</button>
+          </div>
+          <p class="form-feedback full-width" id="ai-config-feedback"></p>
+        </form>
+      </section>
+    </aside>
+
+    <dialog class="modal" id="source-modal">
+      <form class="modal-body" id="source-form">
+        <div class="modal-header">
+          <div>
+            <p class="eyebrow">Source Editor</p>
+            <h3 id="source-modal-title">新增来源</h3>
+          </div>
+          <button class="ghost-button" id="close-modal-button" type="button">关闭</button>
+        </div>
+
+        <input id="source-id" type="hidden" />
+        <div class="form-grid">
+          <label>
+            <span>来源名称</span>
+            <input id="source-name" name="name" required />
+          </label>
+          <label>
+            <span>来源类型</span>
+            <select id="source-type" name="source_type">
+              <option value="api">API</option>
+              <option value="feed">Feed</option>
+              <option value="x">X 订阅</option>
+            </select>
+          </label>
+          <label class="full-width">
+            <span>Endpoint</span>
+            <input id="source-endpoint" name="endpoint" placeholder="https://x.com/OpenAI" required type="url" />
+          </label>
+          <label>
+            <span>Method</span>
+            <select id="source-method" name="method">
+              <option value="GET">GET</option>
+              <option value="POST">POST</option>
+            </select>
+          </label>
+          <label>
+            <span>默认分类</span>
+            <input id="source-category" name="category" value="其他" required />
+          </label>
+          <label>
+            <span>轮询频率（分钟）</span>
+            <input id="source-poll" max="1440" min="1" name="poll_interval_minutes" type="number" value="15" />
+          </label>
+          <label class="full-width">
+            <span>自定义请求头</span>
+            <textarea
+              id="source-headers"
+              name="headers"
+              rows="5"
+              placeholder="{&#10;  &quot;Authorization&quot;: &quot;Bearer xxx&quot;,&#10;  &quot;Cookie&quot;: &quot;session=...&quot;&#10;}"
+            ></textarea>
+            <small class="field-hint">可选。用于附加 HTTP Headers；留空表示不额外发送。系统会自动补充默认的 User-Agent 和 Accept，大多数来源不需要填写。</small>
+          </label>
+          <label class="toggle-chip">
+            <input id="source-enabled" checked name="enabled" type="checkbox" />
+            <span>启用来源</span>
+          </label>
+        </div>
+        <div class="form-actions">
+          <button class="ghost-button" id="test-source-button" type="button">测试连接</button>
+          <button class="primary-button" type="submit">保存来源</button>
+        </div>
+        <p class="form-feedback" id="source-feedback"></p>
+      </form>
+    </dialog>
+
+    <dialog class="modal" id="bulk-x-modal">
+      <form class="modal-body" id="bulk-x-form">
+        <div class="modal-header">
+          <div>
+            <p class="eyebrow">Bulk Import</p>
+            <h3>批量导入 X 订阅</h3>
+          </div>
+          <button class="ghost-button" id="close-bulk-x-modal-button" type="button">关闭</button>
+        </div>
+
+        <div class="form-grid">
+          <label class="full-width">
+            <span>账号列表</span>
+            <textarea
+              id="bulk-x-accounts"
+              rows="8"
+              placeholder="@OpenAI&#10;https://x.com/sama&#10;AnthropicAI"
+              required
+            ></textarea>
+          </label>
+          <label>
+            <span>默认分类</span>
+            <input id="bulk-x-category" value="科技" required />
+          </label>
+          <label>
+            <span>轮询频率（分钟）</span>
+            <input id="bulk-x-poll" max="1440" min="1" type="number" value="15" />
+          </label>
+          <label class="toggle-chip">
+            <input id="bulk-x-enabled" checked type="checkbox" />
+            <span>启用来源</span>
+          </label>
+          <label class="toggle-chip">
+            <input id="bulk-x-sync-after-import" checked type="checkbox" />
+            <span>导入后立即同步</span>
+          </label>
+        </div>
+        <div class="form-actions">
+          <button class="primary-button" type="submit">开始导入</button>
+        </div>
+        <p class="form-feedback" id="bulk-x-feedback"></p>
+      </form>
+    </dialog>
+
+    <template id="timeline-card-template">
+      <article class="cluster-card">
+        <div class="cluster-time-column">
+          <span class="cluster-time"></span>
+          <span class="category-label"></span>
+        </div>
+        <div class="cluster-body">
+          <h3 class="cluster-title"></h3>
+          <p class="cluster-summary"></p>
+          <div class="cluster-footer">
+            <span class="cluster-counts"></span>
+            <div class="score-row">
+              <span class="score-badge score-importance"></span>
+              <span class="score-badge score-heat"></span>
+            </div>
+          </div>
+        </div>
+      </article>
+    </template>
+
+    <script src="/static/app.js?v=11" defer></script>
+  </body>
+</html>

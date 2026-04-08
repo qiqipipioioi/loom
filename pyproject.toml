@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "loom"
+version = "0.1.0"
+description = "Local-first personal news stream for Loom"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.135,<0.136",
+  "uvicorn>=0.42,<0.43",
+  "websockets>=16,<17",
+]
+
+[project.scripts]
+loomctl = "loom_app.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["loom_app*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]

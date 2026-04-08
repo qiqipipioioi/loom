@@ -1,0 +1,2 @@
+[console_scripts]
+loomctl = loom_app.cli:main
