@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from loom_app.market_sources import MARKET_FEEDS
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 DB_PATH = DATA_DIR / "loom.db"
@@ -119,6 +121,35 @@ def initialize_database(connection: sqlite3.Connection) -> None:
                 "WHERE TRIM(COALESCE(original_content, '')) = ''"
             )
     seed_demo_data(connection)
+    install_market_feeds(connection)
+
+
+def install_market_feeds(connection: sqlite3.Connection) -> None:
+    with connection, cursor(connection) as db:
+        installed = db.execute(
+            "INSERT OR IGNORE INTO system_state (state_key, state_value) VALUES (?, ?)",
+            ("market_feeds_installed_v1", "true"),
+        )
+        if not installed.rowcount:
+            return
+
+        existing_endpoints = {
+            row["endpoint"] for row in db.execute("SELECT endpoint FROM sources")
+        }
+        now = utc_now_iso()
+        db.executemany(
+            """
+            INSERT INTO sources (
+                source_id, name, source_type, endpoint, category,
+                poll_interval_minutes, headers_json, created_at, updated_at
+            ) VALUES (?, ?, 'feed', ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (str(uuid4()), name, endpoint, category, interval, json.dumps(headers), now, now)
+                for name, endpoint, category, interval, headers in MARKET_FEEDS
+                if endpoint not in existing_endpoints
+            ],
+        )
 
 
 def seed_demo_data(connection: sqlite3.Connection) -> None:

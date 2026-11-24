@@ -841,6 +841,8 @@ function bindEvents() {
           endpoint: payload.endpoint,
           method: payload.method,
           source_type: payload.source_type,
+          category: payload.category,
+          headers: payload.headers,
         }),
       });
       elements.sourceFeedback.textContent = result.message;

@@ -99,6 +99,8 @@ class SourceTestRequest(BaseModel):
     endpoint: HttpUrl
     method: str = "GET"
     source_type: SourceType = "api"
+    category: str = Field(default="其他", min_length=1, max_length=30)
+    headers: dict[str, Any] = Field(default_factory=dict)
 
 
 class XBulkImportRequest(BaseModel):

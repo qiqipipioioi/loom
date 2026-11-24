@@ -6,7 +6,7 @@ Loom 是一个本地优先的新闻聚合工具，用来抓取多个信息源并
 
 当前版本的核心行为如下：
 
-- 只处理最近 `2` 小时内的新消息
+- 只处理最近 `24` 小时内的新消息
 - 数据库只保留最近 `24` 小时的消息
 - 新消息在抓取后立即执行 AI 翻译和分类
 - 不做翻译/分类回填，不扫描历史消息补跑 AI
@@ -100,6 +100,9 @@ http://127.0.0.1:8000/
 - `api`：返回 XML 或 JSON 的接口
 - `x`：X/Twitter 账号
 
+启动时会一次性导入 19 个市场公告与宏观数据订阅，轮询间隔为 1–3 分钟。
+已有的同地址订阅会保留原配置，后续在设置中停用或删除这些订阅也会保留。
+
 可进行的操作：
 
 - 新增来源
@@ -171,12 +174,12 @@ http://127.0.0.1:8000/
 
 当前版本固定规则：
 
-- 每次启动或同步，只处理最近 `2` 小时的消息
-- 超过 `2` 小时的消息，即使来源返回，也不会进入入库和 AI 处理流程
+- 每次启动或同步，处理最近 `24` 小时的消息
+- 处理窗口与数据库保留窗口一致，服务中断后恢复时不会遗漏当天内容
 
 这部分逻辑位于 [main.py](file:///Users/tuxun/Documents/work/loom/loom_app/main.py)：
 
-- `SYNC_LOOKBACK_HOURS = 2`
+- `SYNC_LOOKBACK_HOURS = 24`
 - `persist_messages()`
 
 ## 数据保留规则
@@ -189,10 +192,7 @@ http://127.0.0.1:8000/
 - 每轮同步结束后会再次清理 `24` 小时前的旧消息
 - 清理后会自动重建聚合结果
 
-也就是说：
-
-- `2` 小时是“抓取处理窗口”
-- `24` 小时是“数据库保留窗口”
+抓取处理窗口和数据库保留窗口当前均为 `24` 小时。
 
 ## 状态说明
 
@@ -272,9 +272,31 @@ http://127.0.0.1:8000/
 
 ### 4. 为什么某些来源返回了很多内容，但最终只看到少量消息
 
-这是当前设计行为：
+系统只处理最近 `24` 小时内的消息；更早的内容不会进入数据库。
 
-- 系统只处理最近 `2` 小时内的消息
+### 5. X 来源提示网络不可达或访客令牌失败
+
+优先在来源的“自定义请求头”中配置 X Developer Console 生成的官方 Bearer Token：
+
+```json
+{"Authorization": "Bearer YOUR_X_API_BEARER_TOKEN"}
+```
+
+配置后 Loom 会使用 X API v2 获取账号和帖子。未配置 Token 时，Loom 会先尝试 X 公开网页，再回退到 FxEmbed 的公开时间线 API。回退服务只接收公开账号名，不会收到来源中配置的 Cookie、Authorization 或其他自定义请求头。
+
+公共时间线 API 可以通过环境变量替换为自托管实例；设置为空字符串可禁用该回退：
+
+```bash
+LOOM_X_PUBLIC_API_BASE_URL=https://your-fxembed.example/2 loomctl start
+```
+
+如果本机不能直接访问 `x.com` 或 `api.x.com`，需要在启动 Loom 时提供可用代理，例如：
+
+```bash
+HTTPS_PROXY=http://127.0.0.1:7890 loomctl start
+```
+
+端口请按本机代理软件的实际配置调整。连续连接失败后，Loom 会短暂暂停其他 X 来源请求，避免一次同步长时间卡住。
 
 ## 开发校验
 
@@ -282,7 +304,7 @@ http://127.0.0.1:8000/
 
 ```bash
 python3 -m ruff check .
-python3 -m compileall loom_app
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 ```
 
 ## 目录说明
@@ -296,6 +318,7 @@ loom/
 │   ├── cli.py
 │   └── static/
 ├── data/
+├── tests/
 ├── pyproject.toml
 └── README.md
 ```

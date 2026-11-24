@@ -3,17 +3,22 @@ from __future__ import annotations
 import asyncio
 import html
 import json
+import logging
+import os
 import re
 import sqlite3
+import time
 import xml.etree.ElementTree as ET
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
+from html.parser import HTMLParser
+from http.client import IncompleteRead, RemoteDisconnected
 from queue import Empty, Queue
 from threading import Lock
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qsl, quote, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 from uuid import uuid4
 
@@ -55,20 +60,49 @@ FROM sources
 """
 X_HOSTS = {"x.com", "www.x.com", "twitter.com", "www.twitter.com", "mobile.twitter.com"}
 X_HANDLE_PATTERN = re.compile(r"^[A-Za-z0-9_]{1,15}$")
+X_PUBLIC_API_BASE_URL = os.getenv(
+    "LOOM_X_PUBLIC_API_BASE_URL", "https://api.fxtwitter.com/2"
+).strip().rstrip("/")
 DEFAULT_ACCEPT_HEADER = (
     "application/json, application/xml, text/xml, "
     "application/rss+xml, text/html;q=0.9"
 )
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36"
+)
 DEFAULT_AI_BASE_URL = "http://127.0.0.1:1234"
 DEFAULT_AI_CATEGORIES = ["时政", "AI", "科技", "宏观", "数字货币", "其他"]
+FETCH_RETRY_ATTEMPTS = 3
+X_NETWORK_COOLDOWN_SECONDS = 60
 sync_lock = asyncio.Lock()
 x_client_cache: dict[str, object] = {}
 x_client_lock = Lock()
+x_network_blocked_until = 0.0
 sync_scheduler_task: asyncio.Task[None] | None = None
 SYNC_TICK_SECONDS = 30
-SYNC_LOOKBACK_HOURS = 2
 NEWS_RETENTION_HOURS = 24
+SYNC_LOOKBACK_HOURS = NEWS_RETENTION_HOURS
 MAX_X_MESSAGES_PER_SOURCE = 10
+logger = logging.getLogger(__name__)
+TRANSIENT_NETWORK_ERRORS = (
+    IncompleteRead,
+    RemoteDisconnected,
+    TimeoutError,
+    ConnectionError,
+    URLError,
+)
+SOURCE_SYNC_ERRORS = (
+    ET.ParseError,
+    ValueError,
+    HTTPError,
+    URLError,
+    json.JSONDecodeError,
+    IncompleteRead,
+    RemoteDisconnected,
+    TimeoutError,
+    ConnectionError,
+)
 
 
 class RealtimeHub:
@@ -114,6 +148,8 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
                 await sync_scheduler_task
             except asyncio.CancelledError:
                 pass
+            except Exception:
+                logger.exception("同步调度任务异常退出")
             sync_scheduler_task = None
 
 
@@ -310,17 +346,82 @@ def list_due_source_rows(reference_time: datetime | None = None) -> list[dict[st
 
 def source_headers(source: dict[str, object]) -> dict[str, str]:
     headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; Loom/0.1; +https://loom.local)",
+        "User-Agent": DEFAULT_USER_AGENT,
         "Accept": DEFAULT_ACCEPT_HEADER,
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Connection": "close",
     }
-    raw_headers = source.get("headers_json") or "{}"
-    try:
-        custom_headers = json.loads(raw_headers)
-    except json.JSONDecodeError:
-        custom_headers = {}
+    custom_headers = source.get("headers")
+    if not isinstance(custom_headers, dict):
+        raw_headers = source.get("headers_json") or "{}"
+        try:
+            custom_headers = json.loads(str(raw_headers))
+        except json.JSONDecodeError:
+            custom_headers = {}
     if isinstance(custom_headers, dict):
         headers.update({str(key): str(value) for key, value in custom_headers.items()})
     return headers
+
+
+def header_value(headers: dict[str, str], name: str) -> str:
+    wanted = name.casefold()
+    for key, value in headers.items():
+        if key.casefold() == wanted:
+            return value
+    return ""
+
+
+def fetch_bytes(
+    url: str,
+    *,
+    method: str = "GET",
+    headers: dict[str, str] | None = None,
+    data: bytes | None = None,
+    timeout: int = 20,
+    attempts: int = FETCH_RETRY_ATTEMPTS,
+) -> tuple[bytes, object, int]:
+    last_error: BaseException | None = None
+    for attempt in range(max(1, attempts)):
+        request = Request(url, data=data, method=method, headers=headers or {})
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                status = int(getattr(response, "status", response.getcode()))
+                return response.read(), response.headers, status
+        except HTTPError as exc:
+            last_error = exc
+            if exc.code not in {408, 425, 429, 500, 502, 503, 504} or attempt + 1 >= attempts:
+                raise
+        except TRANSIENT_NETWORK_ERRORS as exc:
+            last_error = exc
+            if attempt + 1 >= attempts:
+                raise
+        time.sleep(0.2 * (attempt + 1))
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("请求未执行")
+
+
+def fetch_json_url(
+    url: str,
+    *,
+    method: str = "GET",
+    headers: dict[str, str] | None = None,
+    data: bytes | None = None,
+    timeout: int = 20,
+    attempts: int = FETCH_RETRY_ATTEMPTS,
+) -> dict[str, object]:
+    payload, _, _ = fetch_bytes(
+        url,
+        method=method,
+        headers=headers,
+        data=data,
+        timeout=timeout,
+        attempts=attempts,
+    )
+    decoded = json.loads(payload.decode("utf-8", errors="replace"))
+    if not isinstance(decoded, dict):
+        raise ValueError("接口未返回 JSON 对象")
+    return decoded
 
 
 def normalize_x_handle(value: str) -> str:
@@ -361,11 +462,14 @@ def fetch_source_payload(source: dict[str, object]) -> tuple[str, str]:
         return fetch_x_source_payload(source), "application/json"
     endpoint = resolve_source_endpoint(str(source["source_type"]), str(source["endpoint"]))
     method = "GET" if str(source["source_type"]) == "x" else str(source["method"]).upper()
-    request = Request(endpoint, method=method, headers=source_headers(source))
-    with urlopen(request, timeout=12) as response:
-        charset = response.headers.get_content_charset() or "utf-8"
-        payload = response.read().decode(charset, errors="replace")
-        return payload, response.headers.get("Content-Type", "")
+    body, response_headers, _ = fetch_bytes(
+        endpoint,
+        method=method,
+        headers=source_headers(source),
+        timeout=12,
+    )
+    charset = response_headers.get_content_charset() or "utf-8"
+    return body.decode(charset, errors="replace"), response_headers.get("Content-Type", "")
 
 
 def extract_x_handle(endpoint: str) -> str:
@@ -433,26 +537,122 @@ def create_source_record(payload: SourceCreate) -> SourceOut:
     return row_to_source(row)
 
 
-def fetch_text(url: str, headers: dict[str, str] | None = None) -> tuple[str, object]:
-    request = Request(url, headers=headers or {})
-    with urlopen(request, timeout=20) as response:
-        charset = response.headers.get_content_charset() or "utf-8"
-        return response.read().decode(charset, errors="replace"), response.headers
+def fetch_text(
+    url: str,
+    headers: dict[str, str] | None = None,
+    *,
+    timeout: int = 20,
+    attempts: int = FETCH_RETRY_ATTEMPTS,
+) -> tuple[str, object]:
+    body, response_headers, _ = fetch_bytes(
+        url,
+        headers=headers,
+        timeout=timeout,
+        attempts=attempts,
+    )
+    charset = response_headers.get_content_charset() or "utf-8"
+    return body.decode(charset, errors="replace"), response_headers
 
 
-def get_x_client_bundle(profile_html: str) -> dict[str, str]:
+class XProfileArticleParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.posts: list[dict[str, str]] = []
+        self._current: dict[str, str] | None = None
+        self._article_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attributes = {key: value or "" for key, value in attrs}
+        if tag == "article":
+            if self._current is not None:
+                self._article_depth += 1
+                return
+            tweet_id = attributes.get("data-tweet-id", "").strip()
+            if tweet_id:
+                self._current = {"id": tweet_id}
+                self._article_depth = 1
+            return
+        if tag != "meta" or self._current is None or self._article_depth != 1:
+            return
+        item_property = attributes.get("itemprop", "")
+        content = attributes.get("content", "").strip()
+        field_map = {
+            "datePublished": "created_at",
+            "text": "text",
+            "url": "url",
+            "alternateName": "username",
+        }
+        field_name = field_map.get(item_property)
+        if field_name and content and field_name not in self._current:
+            self._current[field_name] = content
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag != "article" or self._current is None:
+            return
+        self._article_depth -= 1
+        if self._article_depth > 0:
+            return
+        if self._current.get("id") and self._current.get("text"):
+            self.posts.append(self._current)
+        self._current = None
+        self._article_depth = 0
+
+
+def extract_x_profile_payload(profile_html: str, fallback_handle: str) -> str:
+    parser = XProfileArticleParser()
+    parser.feed(profile_html)
+    if not parser.posts:
+        return ""
+    posts: list[dict[str, object]] = []
+    username = fallback_handle
+    seen_ids: set[str] = set()
+    for item in parser.posts:
+        post_id = item["id"]
+        if post_id in seen_ids:
+            continue
+        seen_ids.add(post_id)
+        username = item.get("username") or username
+        posts.append(
+            {
+                "id": post_id,
+                "text": item["text"],
+                "created_at": item.get("created_at", ""),
+            }
+        )
+        if len(posts) >= MAX_X_MESSAGES_PER_SOURCE:
+            break
+    return json.dumps(
+        {"data": posts, "loom_username": username},
+        ensure_ascii=False,
+    )
+
+
+def get_x_client_bundle(
+    profile_html: str,
+    request_headers: dict[str, str] | None = None,
+    profile_url: str = "https://x.com/",
+) -> dict[str, str]:
     script_match = re.search(
         r'https://abs\.twimg\.com/responsive-web/client-web/main\.[^"\']+\.js',
         profile_html,
     )
     if not script_match:
-        raise ValueError("未找到 X 客户端脚本")
+        raise ValueError(
+            "X 页面没有可解析的公开帖子；请确认账号公开，或配置官方 X API Bearer Token"
+        )
     main_js_url = script_match.group(0)
     with x_client_lock:
         cached = x_client_cache.get(main_js_url)
         if isinstance(cached, dict):
             return cached
-    main_js, _ = fetch_text(main_js_url)
+    script_headers = dict(request_headers or {})
+    script_headers.update({"Accept": "*/*", "Referer": profile_url})
+    main_js, _ = fetch_text(
+        main_js_url,
+        headers=script_headers,
+        timeout=10,
+        attempts=2,
+    )
     bearer_match = re.search(r'AAAAAAAAAA[^"\']+', main_js)
     user_by_screen_name_match = re.search(
         r'queryId:"([^"]+)",operationName:"UserByScreenName"',
@@ -480,35 +680,153 @@ def fetch_json_from_x_api(
     profile_url: str,
     guest_token: str,
     bearer_token: str,
+    source: dict[str, object],
 ) -> dict[str, object]:
-    request = Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (compatible; Loom/0.1; +https://loom.local)",
+    headers = source_headers(source)
+    existing_cookie = header_value(headers, "Cookie")
+    guest_cookie = f"gt={guest_token}"
+    headers.update(
+        {
             "Accept": "application/json",
             "Authorization": f"Bearer {bearer_token}",
             "X-Guest-Token": guest_token,
             "X-Twitter-Active-User": "yes",
             "X-Twitter-Client-Language": "en",
             "Referer": profile_url,
-            "Cookie": f"gt={guest_token}",
+            "Cookie": f"{existing_cookie}; {guest_cookie}" if existing_cookie else guest_cookie,
+        }
+    )
+    return fetch_json_url(url, headers=headers, timeout=10, attempts=2)
+
+
+def extract_x_guest_token(profile_html: str, response_headers: object) -> str:
+    for pattern in (r"gt=([0-9]+)", r'"guest_token"\s*:\s*"([0-9]+)"'):
+        match = re.search(pattern, profile_html)
+        if match:
+            return match.group(1)
+    get_all = getattr(response_headers, "get_all", None)
+    cookies = get_all("Set-Cookie") if callable(get_all) else []
+    for cookie in cookies or []:
+        match = re.search(r"(?:^|[;,]\s*)gt=([0-9]+)", str(cookie))
+        if match:
+            return match.group(1)
+    return ""
+
+
+def activate_x_guest_token(
+    bearer_token: str,
+    profile_url: str,
+    source: dict[str, object],
+) -> str:
+    headers = source_headers(source)
+    headers.update(
+        {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {bearer_token}",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": "https://x.com",
+            "Referer": profile_url,
+        }
+    )
+    last_error: Exception | None = None
+    for endpoint in (
+        "https://api.x.com/1.1/guest/activate.json",
+        "https://api.twitter.com/1.1/guest/activate.json",
+    ):
+        try:
+            payload = fetch_json_url(
+                endpoint,
+                method="POST",
+                headers=headers,
+                data=b"",
+                timeout=10,
+                attempts=2,
+            )
+        except (HTTPError, URLError, IncompleteRead, RemoteDisconnected, TimeoutError) as exc:
+            last_error = exc
+            continue
+        guest_token = str(payload.get("guest_token") or "").strip()
+        if guest_token:
+            return guest_token
+    message = "X 未提供访客令牌；请在自定义请求头中配置官方 X API Bearer Token"
+    if last_error is not None:
+        raise ValueError(f"{message}（{last_error}）") from last_error
+    raise ValueError(message)
+
+
+def fetch_x_api_v2_payload(
+    handle: str,
+    headers: dict[str, str],
+) -> str:
+    api_headers = dict(headers)
+    api_headers["Accept"] = "application/json"
+    user_url = f"https://api.x.com/2/users/by/username/{quote(handle, safe='')}"
+    user_payload = fetch_json_url(user_url, headers=api_headers, timeout=10, attempts=2)
+    user_data = user_payload.get("data", {})
+    if not isinstance(user_data, dict) or not user_data.get("id"):
+        detail = user_payload.get("detail") or user_payload.get("title") or "未返回用户 ID"
+        raise ValueError(f"X API 无法获取账号 {handle}：{detail}")
+    query = urlencode(
+        {
+            "max_results": MAX_X_MESSAGES_PER_SOURCE,
+            "tweet.fields": "created_at,entities,lang,note_tweet",
+        }
+    )
+    posts_url = f"https://api.x.com/2/users/{quote(str(user_data['id']), safe='')}/tweets?{query}"
+    posts_payload = fetch_json_url(posts_url, headers=api_headers, timeout=10, attempts=2)
+    posts_payload["loom_username"] = str(user_data.get("username") or handle)
+    return json.dumps(posts_payload, ensure_ascii=False)
+
+
+def fetch_x_public_timeline_payload(handle: str) -> str:
+    if not X_PUBLIC_API_BASE_URL:
+        raise ValueError(
+            "X 公共时间线回退已禁用；请配置官方 X API Bearer Token"
+        )
+    endpoint = (
+        f"{X_PUBLIC_API_BASE_URL}/profile/{quote(handle, safe='')}/statuses"
+    )
+    payload = fetch_json_url(
+        endpoint,
+        headers={
+            "User-Agent": DEFAULT_USER_AGENT,
+            "Accept": "application/json",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         },
+        timeout=12,
+        attempts=2,
     )
-    with urlopen(request, timeout=20) as response:
-        return json.loads(response.read().decode("utf-8", errors="replace"))
+    response_code = payload.get("code")
+    if response_code not in {None, 200}:
+        raise ValueError(f"X 公共时间线返回错误：{response_code}")
+    if not isinstance(payload.get("results"), list):
+        raise ValueError("X 公共时间线未返回帖子列表")
+    payload["loom_username"] = handle
+    return json.dumps(payload, ensure_ascii=False)
 
 
-def fetch_x_source_payload(source: dict[str, object]) -> str:
-    handle = extract_x_handle(str(source["endpoint"]))
+def fetch_x_legacy_web_payload(source: dict[str, object], handle: str) -> str:
+    headers = source_headers(source)
     profile_url = f"https://x.com/{quote(handle)}"
-    profile_html, _ = fetch_text(
+    profile_headers = dict(headers)
+    profile_headers["Accept"] = "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8"
+    profile_html, response_headers = fetch_text(
         profile_url,
-        headers={"User-Agent": "Mozilla/5.0 (compatible; Loom/0.1; +https://loom.local)"},
+        headers=profile_headers,
+        timeout=10,
+        attempts=2,
     )
-    guest_token_match = re.search(r"gt=([0-9]+)", profile_html)
-    if not guest_token_match:
-        raise ValueError("未能获取 X 访客令牌")
-    client_bundle = get_x_client_bundle(profile_html)
+    profile_payload = extract_x_profile_payload(profile_html, handle)
+    if profile_payload:
+        return profile_payload
+    client_bundle = get_x_client_bundle(profile_html, profile_headers, profile_url)
+    guest_token = extract_x_guest_token(profile_html, response_headers)
+    if not guest_token:
+        guest_token = activate_x_guest_token(
+            client_bundle["bearer_token"],
+            profile_url,
+            source,
+        )
     user_variables = {"screen_name": handle, "withSafetyModeUserFields": True}
     user_lookup_url = (
         "https://x.com/i/api/graphql/"
@@ -519,8 +837,9 @@ def fetch_x_source_payload(source: dict[str, object]) -> str:
     user_payload = fetch_json_from_x_api(
         user_lookup_url,
         profile_url,
-        guest_token_match.group(1),
+        guest_token,
         client_bundle["bearer_token"],
+        source,
     )
     user_result = (
         user_payload.get("data", {})
@@ -558,10 +877,64 @@ def fetch_x_source_payload(source: dict[str, object]) -> str:
     tweets_payload = fetch_json_from_x_api(
         tweets_lookup_url,
         profile_url,
-        guest_token_match.group(1),
+        guest_token,
         client_bundle["bearer_token"],
+        source,
     )
     return json.dumps(tweets_payload, ensure_ascii=False)
+
+
+def _fetch_x_source_payload(source: dict[str, object]) -> str:
+    handle = extract_x_handle(str(source["endpoint"]))
+    headers = source_headers(source)
+    authorization = header_value(headers, "Authorization").strip()
+    if authorization.casefold().startswith("bearer "):
+        return fetch_x_api_v2_payload(handle, headers)
+
+    try:
+        return fetch_x_legacy_web_payload(source, handle)
+    except SOURCE_SYNC_ERRORS as direct_error:
+        logger.info(
+            "X 主页抓取不可用，改用公共时间线回退：%s (%s)",
+            handle,
+            type(direct_error).__name__,
+        )
+        try:
+            return fetch_x_public_timeline_payload(handle)
+        except SOURCE_SYNC_ERRORS as fallback_error:
+            raise ValueError(
+                "X 主页解析失败，公共时间线回退也不可用："
+                f"{fallback_error}"
+            ) from fallback_error
+
+
+def fetch_x_source_payload(source: dict[str, object]) -> str:
+    global x_network_blocked_until
+    now = time.monotonic()
+    with x_client_lock:
+        blocked_until = x_network_blocked_until
+    if blocked_until > now:
+        wait_seconds = max(1, int(blocked_until - now))
+        raise ValueError(f"X 网络当前不可达，将在约 {wait_seconds} 秒后重试")
+    try:
+        return _fetch_x_source_payload(source)
+    except HTTPError:
+        raise
+    except TRANSIENT_NETWORK_ERRORS as exc:
+        with x_client_lock:
+            x_network_blocked_until = time.monotonic() + X_NETWORK_COOLDOWN_SECONDS
+        raise ValueError(
+            "无法连接 X；请检查网络、VPN，或为 Loom 配置 HTTPS_PROXY"
+        ) from exc
+    except ValueError as exc:
+        cause = exc.__cause__
+        if isinstance(cause, HTTPError) or not isinstance(cause, TRANSIENT_NETWORK_ERRORS):
+            raise
+        with x_client_lock:
+            x_network_blocked_until = time.monotonic() + X_NETWORK_COOLDOWN_SECONDS
+        raise ValueError(
+            "无法连接 X；请检查网络、VPN，或为 Loom 配置 HTTPS_PROXY"
+        ) from exc
 
 
 def local_name(tag: str) -> str:
@@ -1029,8 +1402,20 @@ def parse_feed_entries(source: dict[str, object], payload: str) -> list[dict[str
     items = [child for child in channel if local_name(child.tag) == "item"]
     for item in items:
         title = child_text(item, "title") or ""
-        body = strip_markup(child_text(item, "description", "encoded"))
+        description = child_text(item, "description", "encoded") or ""
+        body = strip_markup(description)
         link = canonicalize_url(child_text(item, "link"))
+        if link in {
+            "https://www.treasurydirect.gov/auctions/auction-announcements/",
+            "https://www.treasurydirect.gov/auctions/auction-results/",
+        }:
+            # TreasuryDirect reuses the listing URL for every item in each feed.
+            auction_document = re.search(
+                r'href=["\'](https://www\.treasurydirect\.gov/instit/[^"\'<>\s]+\.pdf)["\']',
+                description,
+            )
+            if auction_document:
+                link = auction_document.group(1)
         if not title or not link:
             continue
         published_at = parse_published_at(child_text(item, "pubDate", "published", "updated"))
@@ -1175,9 +1560,128 @@ def expand_x_text(text: str, entities: dict[str, object]) -> str:
     return expanded
 
 
+def parse_x_api_v2_entries(
+    source: dict[str, object],
+    decoded: dict[str, object],
+) -> list[dict[str, str]] | None:
+    posts = decoded.get("data")
+    if not isinstance(posts, list):
+        return None
+    category = str(source["category"])
+    fallback_handle = extract_x_handle(str(source["endpoint"]))
+    screen_name = str(decoded.get("loom_username") or fallback_handle)
+    entries: list[dict[str, str]] = []
+    for post in posts:
+        if not isinstance(post, dict):
+            continue
+        post_id = str(post.get("id") or "").strip()
+        note_tweet = post.get("note_tweet", {})
+        note_text = note_tweet.get("text") if isinstance(note_tweet, dict) else ""
+        text = str(note_text or post.get("text") or "").strip()
+        if not post_id or not text:
+            continue
+        entities = post.get("entities", {})
+        if not isinstance(entities, dict):
+            entities = {}
+        body = strip_inline_urls(normalize_whitespace(expand_x_text(text, entities)))
+        title = truncate_text(body, 180)
+        if not title:
+            continue
+        language = str(post.get("lang") or detect_language(body))
+        entries.append(
+            {
+                "original_title": title,
+                "translated_title": title if language == "zh" else "",
+                "summary_zh": build_summary(title, body),
+                "original_content": build_original_content(title, body),
+                "language": language,
+                "category": category,
+                "original_url": canonicalize_url(
+                    f"https://x.com/{quote(screen_name)}/status/{quote(post_id)}"
+                ),
+                "published_at": parse_published_at(str(post.get("created_at") or "")),
+            }
+        )
+        if len(entries) >= MAX_X_MESSAGES_PER_SOURCE:
+            break
+    return entries
+
+
+def parse_x_public_timeline_entries(
+    source: dict[str, object],
+    decoded: dict[str, object],
+) -> list[dict[str, str]] | None:
+    posts = decoded.get("results")
+    if not isinstance(posts, list):
+        return None
+    category = str(source["category"])
+    fallback_handle = extract_x_handle(str(source["endpoint"]))
+    entries: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
+    for post in posts:
+        if not isinstance(post, dict):
+            continue
+        post_id = str(post.get("id") or "").strip()
+        text = str(post.get("text") or "").strip()
+        if not post_id or not text:
+            continue
+        entities = post.get("entities", {})
+        if not isinstance(entities, dict):
+            entities = {}
+        body = strip_inline_urls(normalize_whitespace(expand_x_text(text, entities)))
+        title = truncate_text(body, 180)
+        if not title:
+            continue
+        author = post.get("author", {})
+        screen_name = (
+            str(author.get("screen_name") or "").strip()
+            if isinstance(author, dict)
+            else ""
+        )
+        candidate_url = str(post.get("url") or "").strip()
+        parsed_url = urlsplit(candidate_url)
+        if (
+            parsed_url.scheme.lower() not in {"http", "https"}
+            or parsed_url.netloc.lower() not in X_HOSTS
+        ):
+            candidate_url = (
+                f"https://x.com/{quote(screen_name or fallback_handle)}/status/"
+                f"{quote(post_id)}"
+            )
+        url = canonicalize_url(candidate_url)
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+        language = str(post.get("lang") or detect_language(body))
+        published_value = post.get("created_at") or post.get("created_timestamp") or ""
+        entries.append(
+            {
+                "original_title": title,
+                "translated_title": title if language == "zh" else "",
+                "summary_zh": build_summary(title, body),
+                "original_content": build_original_content(title, body),
+                "language": language,
+                "category": category,
+                "original_url": url,
+                "published_at": parse_published_at(str(published_value)),
+            }
+        )
+        if len(entries) >= MAX_X_MESSAGES_PER_SOURCE:
+            break
+    return entries
+
+
 def parse_x_entries(source: dict[str, object], payload: str) -> list[dict[str, str]]:
     category = str(source["category"])
     decoded = json.loads(payload)
+    if not isinstance(decoded, dict):
+        raise ValueError("X 接口未返回 JSON 对象")
+    public_timeline_entries = parse_x_public_timeline_entries(source, decoded)
+    if public_timeline_entries is not None:
+        return public_timeline_entries
+    api_v2_entries = parse_x_api_v2_entries(source, decoded)
+    if api_v2_entries is not None:
+        return api_v2_entries
     entries: list[dict[str, str]] = []
     seen_urls: set[str] = set()
     for tweet_result in iter_x_timeline_tweet_results(decoded):
@@ -1570,7 +2074,7 @@ def run_sync(source_id: str | None = None) -> dict[str, object]:
             if result["ai_failed_messages"]:
                 summary["warning_sources"] += 1
             summary["results"].append({"source_id": source["source_id"], "status": "ok", **result})
-        except (ET.ParseError, ValueError, HTTPError, URLError, json.JSONDecodeError) as exc:
+        except SOURCE_SYNC_ERRORS as exc:
             with cursor(connection) as db:
                 db.execute(
                     """
@@ -1630,7 +2134,7 @@ def run_due_sync(reference_time: datetime | None = None) -> dict[str, object]:
             if result["ai_failed_messages"]:
                 summary["warning_sources"] += 1
             summary["results"].append({"source_id": source["source_id"], "status": "ok", **result})
-        except (ET.ParseError, ValueError, HTTPError, URLError, json.JSONDecodeError) as exc:
+        except SOURCE_SYNC_ERRORS as exc:
             with cursor(connection) as db:
                 db.execute(
                     """
@@ -1668,8 +2172,14 @@ def run_due_sync(reference_time: datetime | None = None) -> dict[str, object]:
 async def sync_scheduler_loop() -> None:
     while True:
         await asyncio.sleep(SYNC_TICK_SECONDS)
-        async with sync_lock:
-            result = await asyncio.to_thread(run_due_sync)
+        try:
+            async with sync_lock:
+                result = await asyncio.to_thread(run_due_sync)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("后台同步失败，调度器将在下一轮继续")
+            continue
         if not result["processed_sources"] and not result["updated_messages"]:
             continue
         emit("sources_changed")
@@ -1821,38 +2331,28 @@ async def delete_source(source_id: str) -> None:
 
 @app.post("/api/sources/test", response_model=SourceTestResponse)
 async def test_source(payload: SourceTestRequest) -> SourceTestResponse:
-    if payload.source_type == "x":
-        try:
-            fetch_x_source_payload(
-                {
-                    "source_type": payload.source_type,
-                    "endpoint": str(payload.endpoint),
-                }
-            )
-            return SourceTestResponse(ok=True, status_code=200, message="X 账号连接成功")
-        except (ValueError, HTTPError, URLError, json.JSONDecodeError) as exc:
-            status_code = exc.code if isinstance(exc, HTTPError) else None
-            return SourceTestResponse(ok=False, status_code=status_code, message=str(exc))
-    endpoint = resolve_source_endpoint(payload.source_type, str(payload.endpoint))
-    request = Request(
-        endpoint,
-        method="GET" if payload.source_type == "x" else payload.method.upper(),
-        headers={
-            "User-Agent": "Mozilla/5.0 (compatible; Loom/0.1; +https://loom.local)",
-            "Accept": DEFAULT_ACCEPT_HEADER,
-        },
-    )
+    source: dict[str, object] = {
+        "source_type": payload.source_type,
+        "endpoint": str(payload.endpoint),
+        "method": payload.method.upper(),
+        "category": payload.category,
+        "headers": payload.headers,
+    }
     try:
-        with urlopen(request, timeout=6) as response:
-            return SourceTestResponse(ok=True, status_code=response.status, message="连接成功")
-    except HTTPError as exc:
+        raw_payload, content_type = await asyncio.to_thread(fetch_source_payload, source)
+        messages = parse_source_entries(source, raw_payload, content_type)
+        if not messages:
+            raise ValueError("连接成功，但未解析到任何消息")
+        source_label = "X 账号" if payload.source_type == "x" else "来源"
         return SourceTestResponse(
-            ok=False,
-            status_code=exc.code,
-            message=f"目标返回 HTTP {exc.code}",
+            ok=True,
+            status_code=200,
+            message=f"{source_label}连接并解析成功，共 {len(messages)} 条",
         )
-    except URLError as exc:
-        return SourceTestResponse(ok=False, status_code=None, message=f"连接失败：{exc.reason}")
+    except SOURCE_SYNC_ERRORS as exc:
+        status_code = exc.code if isinstance(exc, HTTPError) else None
+        message = f"目标返回 HTTP {exc.code}" if isinstance(exc, HTTPError) else str(exc)
+        return SourceTestResponse(ok=False, status_code=status_code, message=message)
 
 
 @app.get("/api/ai/config", response_model=AIConfigResponse)

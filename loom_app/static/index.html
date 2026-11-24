@@ -200,7 +200,7 @@
               rows="5"
               placeholder="{&#10;  &quot;Authorization&quot;: &quot;Bearer xxx&quot;,&#10;  &quot;Cookie&quot;: &quot;session=...&quot;&#10;}"
             ></textarea>
-            <small class="field-hint">可选。用于附加 HTTP Headers；留空表示不额外发送。系统会自动补充默认的 User-Agent 和 Accept，大多数来源不需要填写。</small>
+            <small class="field-hint">可选。系统会自动补充 User-Agent 和 Accept。X 来源建议填写官方 API 凭证，例如 {"Authorization":"Bearer ..."}；凭证仅保存在本机数据库中。</small>
           </label>
           <label class="toggle-chip">
             <input id="source-enabled" checked name="enabled" type="checkbox" />
@@ -279,6 +279,6 @@
       </article>
     </template>
 
-    <script src="/static/app.js?v=11" defer></script>
+    <script src="/static/app.js?v=12" defer></script>
   </body>
 </html>
