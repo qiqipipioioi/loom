@@ -27,6 +27,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from loom_app.clustering import headline, same_story
 from loom_app.database import (
     cursor,
     initialize_database,
@@ -136,8 +137,14 @@ connection = make_connection()
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     global sync_scheduler_task
     initialize_database(connection)
-    with cursor(connection) as db:
+    with connection, cursor(connection) as db:
+        installed = db.execute(
+            "INSERT OR IGNORE INTO system_state (state_key, state_value) VALUES (?, ?)",
+            ("headline_clustering_v2", "true"),
+        ).rowcount
         cleanup_expired_news(db)
+        if installed:
+            rebuild_clusters(db)
     sync_scheduler_task = asyncio.create_task(sync_scheduler_loop())
     try:
         yield
@@ -298,21 +305,26 @@ def is_within_sync_lookback(published_at: str, reference_time: datetime | None =
 
 def cleanup_expired_news(db, reference_time: datetime | None = None) -> int:
     cutoff_iso = news_retention_cutoff(reference_time).isoformat()
-    expired_rows = db.execute(
-        "SELECT message_id FROM messages WHERE published_at < ?",
+    affected_clusters = db.execute(
+        """
+        SELECT DISTINCT cmm.cluster_id
+        FROM cluster_message_map cmm
+        JOIN messages m ON m.message_id = cmm.message_id
+        WHERE m.published_at < ?
+        """,
         (cutoff_iso,),
     ).fetchall()
-    if not expired_rows:
-        return 0
     db.execute(
         "DELETE FROM cluster_message_map WHERE message_id IN "
         "(SELECT message_id FROM messages WHERE published_at < ?)",
         (cutoff_iso,),
     )
-    db.execute("DELETE FROM messages WHERE published_at < ?", (cutoff_iso,))
-    rebuild_clusters(db)
-    set_system_state(db, {"last_cleanup_at": utc_now_iso()})
-    return len(expired_rows)
+    deleted = db.execute("DELETE FROM messages WHERE published_at < ?", (cutoff_iso,)).rowcount
+    for cluster in affected_clusters:
+        refresh_cluster_stats(db, cluster["cluster_id"])
+    if deleted:
+        set_system_state(db, {"last_cleanup_at": utc_now_iso()})
+    return deleted
 
 
 def source_last_polled_at(source: dict[str, object]) -> datetime | None:
@@ -1789,11 +1801,20 @@ def refresh_cluster_stats(db, cluster_id: str) -> None:
         """,
         (cluster_id,),
     ).fetchone()
-    cluster = db.execute(
-        "SELECT primary_category FROM clusters WHERE cluster_id = ?",
+    latest = db.execute(
+        """
+        SELECT COALESCE(NULLIF(m.translated_title, ''), m.original_title) AS title,
+               m.summary_zh, m.category, m.original_url
+        FROM cluster_message_map cmm
+        JOIN messages m ON m.message_id = cmm.message_id
+        WHERE cmm.cluster_id = ?
+        ORDER BY m.published_at DESC, m.created_at DESC, m.message_id DESC
+        LIMIT 1
+        """,
         (cluster_id,),
     ).fetchone()
-    if not stats or not cluster:
+    if not latest:
+        db.execute("DELETE FROM clusters WHERE cluster_id = ?", (cluster_id,))
         return
     message_count = int(stats["message_count"] or 0)
     source_count = int(stats["source_count"] or 0)
@@ -1801,51 +1822,62 @@ def refresh_cluster_stats(db, cluster_id: str) -> None:
     db.execute(
         """
         UPDATE clusters
-        SET source_count = ?, message_count = ?, latest_published_at = ?,
-            importance_score = ?, heat_score = ?
+        SET canonical_title = ?, canonical_summary_zh = ?, primary_category = ?,
+            original_link = ?, source_count = ?, message_count = ?,
+            latest_published_at = ?, importance_score = ?, heat_score = ?
         WHERE cluster_id = ?
         """,
         (
+            latest["title"],
+            latest["summary_zh"] or "",
+            latest["category"],
+            latest["original_url"],
             source_count,
             message_count,
             latest_published_at,
-            compute_importance_score(cluster["primary_category"], source_count, message_count),
+            compute_importance_score(latest["category"], source_count, message_count),
             compute_heat_score(source_count, message_count, latest_published_at),
             cluster_id,
         ),
     )
 
 
-def upsert_cluster_for_message(db, message: dict[str, str]) -> str:
+def upsert_cluster_for_message(
+    db, message: dict[str, str], *, preferred_cluster_id: str | None = None
+) -> str:
     canonical_title = message["translated_title"] or message["original_title"]
-    cluster = db.execute(
+    original = headline(message["original_title"])
+    canonical = headline(canonical_title)
+    candidates = db.execute(
         """
-        SELECT cluster_id, latest_published_at
-        FROM clusters
-        WHERE canonical_title = ? AND primary_category = ?
-        ORDER BY latest_published_at DESC
-        LIMIT 1
-        """,
-        (canonical_title, message["category"]),
-    ).fetchone()
-    if cluster:
-        db.execute(
-            """
-            UPDATE clusters
-            SET canonical_summary_zh = ?, original_link = ?,
-                latest_published_at = MAX(latest_published_at, ?)
-            WHERE cluster_id = ?
-            """,
-            (
-                message["summary_zh"],
-                message["original_url"],
-                message["published_at"],
-                cluster["cluster_id"],
-            ),
+        SELECT cmm.cluster_id, m.original_title, m.translated_title, m.category
+        FROM cluster_message_map cmm
+        JOIN messages m ON m.message_id = cmm.message_id
+        ORDER BY m.published_at ASC, m.created_at ASC, m.message_id ASC
+        """
+    ).fetchall()
+    matches = dict.fromkeys(
+        row["cluster_id"]
+        for row in candidates
+        if same_story(
+            original,
+            canonical,
+            headline(row["original_title"]),
+            headline(row["translated_title"] or row["original_title"]),
+            same_category=message["category"] == row["category"],
         )
-        return str(cluster["cluster_id"])
+    )
+    if matches:
+        cluster_id = next(iter(matches))
+        for duplicate_id in matches.keys() - {cluster_id}:
+            db.execute(
+                "UPDATE cluster_message_map SET cluster_id = ? WHERE cluster_id = ?",
+                (cluster_id, duplicate_id),
+            )
+            db.execute("DELETE FROM clusters WHERE cluster_id = ?", (duplicate_id,))
+        return cluster_id
 
-    cluster_id = str(uuid4())
+    cluster_id = preferred_cluster_id or str(uuid4())
     db.execute(
         """
         INSERT INTO clusters (
@@ -1873,34 +1905,33 @@ def upsert_cluster_for_message(db, message: dict[str, str]) -> str:
 
 
 def rebuild_clusters(db) -> int:
+    previous_ids = {
+        row["message_id"]: row["cluster_id"]
+        for row in db.execute("SELECT message_id, cluster_id FROM cluster_message_map")
+    }
     db.execute("DELETE FROM cluster_message_map")
     db.execute("DELETE FROM clusters")
     rows = db.execute(
         """
         SELECT message_id, original_title, translated_title, summary_zh,
-               original_content, language, category, original_url, published_at
+               category, original_url, published_at
         FROM messages
-        ORDER BY published_at ASC, created_at ASC
+        ORDER BY published_at ASC, created_at ASC, message_id ASC
         """
     ).fetchall()
-    cluster_ids: set[str] = set()
+    assigned_ids: set[str] = set()
     for row in rows:
-        message = {
-            "original_title": str(row["original_title"]),
-            "translated_title": str(row["translated_title"] or ""),
-            "summary_zh": str(row["summary_zh"] or ""),
-            "original_content": str(row["original_content"] or ""),
-            "language": str(row["language"]),
-            "category": str(row["category"]),
-            "original_url": str(row["original_url"]),
-            "published_at": str(row["published_at"]),
-        }
-        cluster_id = upsert_cluster_for_message(db, message)
+        message = {key: value or "" for key, value in dict(row).items()}
+        previous_id = previous_ids.get(row["message_id"])
+        cluster_id = upsert_cluster_for_message(
+            db, message, preferred_cluster_id=None if previous_id in assigned_ids else previous_id
+        )
         db.execute(
             "INSERT OR IGNORE INTO cluster_message_map (cluster_id, message_id) VALUES (?, ?)",
             (cluster_id, row["message_id"]),
         )
-        cluster_ids.add(cluster_id)
+        assigned_ids.add(cluster_id)
+    cluster_ids = [row["cluster_id"] for row in db.execute("SELECT cluster_id FROM clusters")]
     for cluster_id in cluster_ids:
         refresh_cluster_stats(db, cluster_id)
     return len(cluster_ids)
@@ -1931,7 +1962,7 @@ def persist_messages(
     updated_messages = 0
     ai_failed_messages = 0
     ai_error_message: str | None = None
-    with cursor(connection) as db:
+    with connection, cursor(connection) as db:
         for message in messages:
             if not is_within_sync_lookback(message["published_at"], reference_time):
                 continue
@@ -1985,8 +2016,10 @@ def persist_messages(
             refresh_cluster_stats(db, cluster_id)
             added_messages += 1
             added_clusters.add(cluster_id)
-        if updated_messages:
-            rebuild_clusters(db)
+        if len(added_clusters) > 1:
+            added_clusters.intersection_update(
+                row["cluster_id"] for row in db.execute("SELECT cluster_id FROM clusters")
+            )
     return (
         added_messages,
         len(added_clusters),
@@ -2097,7 +2130,7 @@ def run_sync(source_id: str | None = None) -> dict[str, object]:
     network_status = "online" if summary["successful_sources"] else "degraded"
     if summary["failed_sources"] and summary["successful_sources"]:
         network_status = "degraded"
-    with cursor(connection) as db:
+    with connection, cursor(connection) as db:
         set_system_state(
             db,
             {
@@ -2157,7 +2190,7 @@ def run_due_sync(reference_time: datetime | None = None) -> dict[str, object]:
     network_status = "online" if summary["successful_sources"] else "degraded"
     if summary["failed_sources"] and summary["successful_sources"]:
         network_status = "degraded"
-    with cursor(connection) as db:
+    with connection, cursor(connection) as db:
         set_system_state(
             db,
             {
@@ -2451,7 +2484,7 @@ async def get_timeline(
                    FROM cluster_message_map cmm
                    JOIN messages m ON m.message_id = cmm.message_id
                    WHERE cmm.cluster_id = c.cluster_id
-                   ORDER BY m.published_at DESC, m.created_at DESC
+                   ORDER BY m.published_at DESC, m.created_at DESC, m.message_id DESC
                    LIMIT 1
                ) AS canonical_original_title,
                c.canonical_summary_zh,
@@ -2460,7 +2493,7 @@ async def get_timeline(
                    FROM cluster_message_map cmm
                    JOIN messages m ON m.message_id = cmm.message_id
                    WHERE cmm.cluster_id = c.cluster_id
-                   ORDER BY m.published_at DESC, m.created_at DESC
+                   ORDER BY m.published_at DESC, m.created_at DESC, m.message_id DESC
                    LIMIT 1
                ) AS canonical_language,
                c.primary_category, c.importance_score, c.heat_score,
@@ -2493,7 +2526,7 @@ async def get_cluster_messages(cluster_id: str) -> list[ClusterMessageOut]:
         JOIN messages m ON m.message_id = cmm.message_id
         JOIN sources s ON s.source_id = m.source_id
         WHERE cmm.cluster_id = ?
-        ORDER BY m.published_at DESC
+        ORDER BY m.published_at DESC, m.created_at DESC, m.message_id DESC
         """,
         (cluster_id,),
     ).fetchall()

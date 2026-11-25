@@ -14,6 +14,7 @@ const state = {
 const AUTO_REFRESH_INTERVAL_MS = 60000;
 const TIMELINE_PAGE_SIZE = 20;
 let timelineLoadObserver = null;
+let detailRequestId = 0;
 
 const elements = {
   timelineOverview: document.getElementById("timeline-overview"),
@@ -278,13 +279,19 @@ function renderTimeline() {
   }
 }
 
-async function openCluster(clusterId) {
+async function openCluster(clusterId, { refresh = false } = {}) {
+  const requestId = ++detailRequestId;
   state.selectedClusterId = clusterId;
-  renderTimeline();
-  elements.detailPanel.innerHTML =
-    '<div class="detail-placeholder"><p class="eyebrow">Detail</p><h3>正在加载详情</h3></div>';
+  if (!refresh) {
+    renderTimeline();
+    elements.detailPanel.innerHTML =
+      '<div class="detail-placeholder"><p class="eyebrow">Detail</p><h3>正在加载详情</h3></div>';
+  }
   try {
     const messages = await fetchJson(`/api/clusters/${clusterId}/messages`);
+    if (requestId !== detailRequestId || state.selectedClusterId !== clusterId) {
+      return;
+    }
     const currentCluster = state.clusters.find((item) => item.cluster_id === clusterId);
     if (!currentCluster) {
       return;
@@ -333,6 +340,9 @@ async function openCluster(clusterId) {
         .join("")}
     `;
   } catch (error) {
+    if (requestId !== detailRequestId || state.selectedClusterId !== clusterId) {
+      return;
+    }
     delete elements.detailPanel.dataset.category;
     elements.detailPanel.innerHTML = `
       <div class="detail-placeholder">
@@ -656,7 +666,7 @@ function buildTimelineSearchParams(offset = 0) {
   return search;
 }
 
-async function loadTimeline({ append = false } = {}) {
+async function loadTimeline({ append = false, refreshDetail = false } = {}) {
   if (append && (!state.timelineHasMore || state.timelineLoadingMore)) {
     return;
   }
@@ -667,6 +677,7 @@ async function loadTimeline({ append = false } = {}) {
     const payload = await fetchJson(
       `/api/timeline/clusters?${buildTimelineSearchParams(nextOffset).toString()}`
     );
+    const previousSelection = state.clusters.find((item) => item.cluster_id === state.selectedClusterId);
     const incomingClusters = payload.clusters || [];
     if (append) {
       const existingIds = new Set(state.clusters.map((item) => item.cluster_id));
@@ -678,11 +689,19 @@ async function loadTimeline({ append = false } = {}) {
     }
     state.timelineTotal = payload.total || state.clusters.length;
     state.timelineHasMore = Boolean(payload.has_more);
-    if (!state.clusters.find((item) => item.cluster_id === state.selectedClusterId)) {
+    const selection = state.clusters.find((item) => item.cluster_id === state.selectedClusterId);
+    if (!selection) {
       state.selectedClusterId = null;
       delete elements.detailPanel.dataset.category;
     }
     renderTimeline();
+    if (!append && selection && (
+      refreshDetail ||
+      selection.message_count !== previousSelection?.message_count ||
+      selection.latest_published_at !== previousSelection?.latest_published_at
+    )) {
+      await openCluster(selection.cluster_id, { refresh: true });
+    }
   } finally {
     state.timelineLoadingMore = false;
     renderTimelineLoadMore();
@@ -728,8 +747,8 @@ async function loadAIConfig() {
   renderAIConfig();
 }
 
-async function refreshAll() {
-  await Promise.all([loadTimeline(), loadSources(), loadSystem()]);
+async function refreshAll({ refreshDetail = false } = {}) {
+  await Promise.all([loadTimeline({ refreshDetail }), loadSources(), loadSystem()]);
 }
 
 function connectSocket() {
@@ -743,7 +762,7 @@ function connectSocket() {
     if (payload.type === "heartbeat") {
       return;
     }
-    await refreshAll();
+    await refreshAll({ refreshDetail: payload.type === "timeline_changed" });
   });
   socket.addEventListener("close", () => {
     elements.socketIndicator.dataset.state = "disconnected";
